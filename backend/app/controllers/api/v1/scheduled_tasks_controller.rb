@@ -1,87 +1,52 @@
 class Api::V1::ScheduledTasksController < ApplicationController
-  skip_before_action :verify_authenticity_token
+  skip_before_action :authenticate, only: [:fetch_posts]
 
-  # POST /api/v1/scheduled_tasks/fetch_posts
   def fetch_posts
-    # アクティブなキーワードを取得
-    active_keywords = Keyword.where(active: true).pluck(:word)
+    client = XApiClient.new
+    active_keywords = Keyword.where(active: true)
     
-    if active_keywords.empty?
-      render json: { error: "アクティブなキーワードが設定されていません" }, status: :unprocessable_entity
-      return
-    end
-
-    # X APIを使用して投稿を検索
-    x_client = XApiClient.new
-    search_results = x_client.search_posts(active_keywords)
+    posts_count = 0
     
-    if search_results[:error].present?
-      render json: { error: search_results[:error] }, status: :unprocessable_entity
-      return
-    end
-    
-    # 検索結果を処理して保存
-    saved_posts = process_and_save_posts(search_results, active_keywords)
-    
-    render json: { success: true, posts_count: saved_posts.size }
-  end
-
-  private
-  
-  def process_and_save_posts(search_results, keywords)
-    saved_posts = []
-    
-    # APIレスポンスの構造に応じて処理
-    tweets = search_results['data'] || []
-    users = {}
-    
-    # ユーザー情報をマッピング
-    if search_results['includes'] && search_results['includes']['users']
-      search_results['includes']['users'].each do |user|
-        users[user['id']] = user
-      end
-    end
-    
-    tweets.each do |tweet|
-      # すでに存在するポストはスキップ
-      next if Post.exists?(x_post_id: tweet['id'])
+    active_keywords.each do |keyword|
+      search_results = client.search_posts(keyword.word)
       
-      # ユーザー情報を取得
-      user = users[tweet['author_id']] || {}
-      
-      # いいね数を取得
-      likes_count = tweet.dig('public_metrics', 'like_count') || 0
-      
-      # 投稿日時をパース
-      posted_at = tweet['created_at'] ? Time.parse(tweet['created_at']) : Time.current
-      
-      # 1ヶ月以内の投稿かつ10いいね以上のみ保存
-      next if posted_at < 1.month.ago || likes_count < 10
-      
-      # ポストを作成
-      post = Post.new(
-        x_post_id: tweet['id'],
-        content: tweet['text'],
-        author_username: user['username'],
-        author_name: user['name'],
-        likes_count: likes_count,
-        posted_at: posted_at,
-        used: false
-      )
-      
-      if post.save
-        saved_posts << post
-        
-        # キーワードとの関連付け
-        keywords.each do |keyword|
-          if post.content.downcase.include?(keyword.downcase)
-            keyword_record = Keyword.find_by(word: keyword)
-            PostKeyword.create(post: post, keyword: keyword_record) if keyword_record
+      if search_results["data"].present?
+        search_results["data"].each do |tweet|
+          # 既存のポストをスキップ
+          next if Post.exists?(x_post_id: tweet["id"])
+          
+          # いいね数が10以上のポストのみ取得
+          metrics = tweet["public_metrics"]
+          next if metrics.nil? || metrics["like_count"].to_i < 10
+          
+          # 1ヶ月以内のポストのみ取得
+          created_at = Time.parse(tweet["created_at"])
+          next if created_at < 1.month.ago
+          
+          # ユーザー情報を取得
+          user_info = client.get_user(tweet["author_id"])
+          
+          if user_info["data"].present?
+            # ポストを保存
+            post = Post.create(
+              x_post_id: tweet["id"],
+              content: tweet["text"],
+              author_username: user_info["data"]["username"],
+              author_name: user_info["data"]["name"],
+              likes_count: metrics["like_count"].to_i,
+              posted_at: created_at,
+              used: false
+            )
+            
+            # キーワードとの関連付け
+            post.keywords << keyword
+            
+            posts_count += 1
           end
         end
       end
     end
     
-    saved_posts
+    render json: { success: true, posts_count: posts_count }
   end
 end
